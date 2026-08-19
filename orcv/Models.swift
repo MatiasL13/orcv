@@ -13,20 +13,27 @@ enum WorkspaceLayoutMode: String {
 struct DisplayDescriptor {
     let displayID: CGDirectDisplayID
     let title: String
+    /// Native backing resolution of the display. Drives aspect ratio and tile size.
     let pixelSize: CGSize
+    /// Resolution to ask the capture stream for. Defaults to native; the canvas asks
+    /// for the size it actually draws, which is usually far smaller.
+    let captureSize: CGSize
     let kind: WorkspaceKind
+    /// Frames per second to request. Zero means "stop capturing this display".
     let maxFPS: Double
 
     init(
         displayID: CGDirectDisplayID,
         title: String,
         pixelSize: CGSize,
+        captureSize: CGSize? = nil,
         kind: WorkspaceKind,
         maxFPS: Double = 60.0
     ) {
         self.displayID = displayID
         self.title = title
         self.pixelSize = pixelSize
+        self.captureSize = captureSize ?? pixelSize
         self.kind = kind
         self.maxFPS = maxFPS
     }

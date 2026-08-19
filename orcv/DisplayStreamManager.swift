@@ -80,8 +80,15 @@ final class DisplayStreamManager {
         }
 
         for (displayID, descriptor) in uniqueByDisplay {
-            let expectedWidth = Int(max(1.0, descriptor.pixelSize.width))
-            let expectedHeight = Int(max(1.0, descriptor.pixelSize.height))
+            // Zero fps means the tile is not on screen: release the stream and its
+            // surface pool entirely instead of capturing it at a trickle.
+            guard descriptor.maxFPS > 0.0 else {
+                stopStream(for: displayID, discardLastFrame: false)
+                continue
+            }
+
+            let expectedWidth = Int(max(1.0, descriptor.captureSize.width))
+            let expectedHeight = Int(max(1.0, descriptor.captureSize.height))
             let expectedMaxFPS = normalizedMaxFPS(descriptor.maxFPS)
 
             if let existing = entries[displayID] {
@@ -99,20 +106,22 @@ final class DisplayStreamManager {
     }
 
     private func startStream(for descriptor: DisplayDescriptor, attempt: Int) {
-        guard targetDescriptors[descriptor.displayID] != nil else {
+        guard let target = targetDescriptors[descriptor.displayID], target.maxFPS > 0.0 else {
             return
         }
         if entries[descriptor.displayID] != nil {
             return
         }
 
-        let outputWidth = Int(max(1.0, descriptor.pixelSize.width))
-        let outputHeight = Int(max(1.0, descriptor.pixelSize.height))
+        let outputWidth = Int(max(1.0, descriptor.captureSize.width))
+        let outputHeight = Int(max(1.0, descriptor.captureSize.height))
         let maxFPS = normalizedMaxFPS(descriptor.maxFPS)
         let minFrameTime = 1.0 / maxFPS
         let streamProperties: CFDictionary = [
             "kCGDisplayStreamShowCursor" as CFString: kCFBooleanTrue as Any,
             CGDisplayStream.minimumFrameTime as CFString: NSNumber(value: minFrameTime),
+            // Default is 3; two is enough here and each surface costs width*height*4.
+            CGDisplayStream.queueDepth as CFString: NSNumber(value: 2),
         ] as CFDictionary
 
         let handler: CGDisplayFrameHandler = { [weak self] status, _, frameSurface, _ in
@@ -180,7 +189,9 @@ final class DisplayStreamManager {
         return min(120.0, max(1.0, fps))
     }
 
-    private func stopStream(for displayID: CGDirectDisplayID) {
+    /// `discardLastFrame: false` keeps the cached surface so a paused tile shows its
+    /// last frame instead of going blank.
+    private func stopStream(for displayID: CGDirectDisplayID, discardLastFrame: Bool = true) {
         guard let entry = entries.removeValue(forKey: displayID) else { return }
         _ = entry.handler
         _ = entry.width
@@ -188,6 +199,7 @@ final class DisplayStreamManager {
 
         _ = rawCGDisplayStreamStop(entry.stream)
 
+        guard discardLastFrame else { return }
         _ = surfaceQueue.sync(flags: .barrier) {
             latestSurfaces.removeValue(forKey: displayID)
         }

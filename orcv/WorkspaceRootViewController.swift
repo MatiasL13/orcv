@@ -122,6 +122,8 @@ final class WorkspaceRootViewController: NSViewController {
     private var lastDisplayDescriptorSignature: UInt64?
     private let defaultVisibleDisplayFPS: Double = 60.0
     private let offscreenDisplayFPS: Double = 2.0
+    /// Zero tells the stream manager to stop capturing entirely.
+    private let stoppedDisplayFPS: Double = 0.0
     private let backgroundDisplayFPS: Double = 1.0
     private var cameraHistory: [CameraHistoryEntry] = []
     private var cameraHistoryCursor: Int = -1
@@ -402,7 +404,7 @@ final class WorkspaceRootViewController: NSViewController {
         streamManager.onDisplayFrame = { [weak self] displayID, surface in
             self?.gridView.refreshPreviews(for: displayID)
             self?.previewWindowController.consumeFrame(displayID: displayID, surface: surface)
-            self?.maybeRefreshDisplayPixelSizeFromSystem(displayID: displayID, surface: surface)
+            self?.maybeRefreshDisplayPixelSizeFromSystem(displayID: displayID)
         }
 
         streamManager.onError = { [weak self] message in
@@ -778,12 +780,15 @@ final class WorkspaceRootViewController: NSViewController {
                 interactionUnlockForDisplay: interactionUnlockDisplayID == immersiveDisplayID
             )
             return workspaces.map { workspace in
-                DisplayDescriptor(
+                let isImmersive = workspace.displayID == immersiveDisplayID
+                return DisplayDescriptor(
                     displayID: workspace.displayID,
                     title: workspace.title,
                     pixelSize: workspace.displayPixelSize,
+                    // The immersive window fills a whole screen, so it needs native pixels.
+                    captureSize: isImmersive ? workspace.displayPixelSize : nil,
                     kind: workspace.kind,
-                    maxFPS: workspace.displayID == immersiveDisplayID ? immersiveFPS : backgroundDisplayFPS
+                    maxFPS: isImmersive ? immersiveFPS : stoppedDisplayFPS
                 )
             }
         }
@@ -791,17 +796,20 @@ final class WorkspaceRootViewController: NSViewController {
         let windowVisible = isOrcvWindowVisibleForCapture()
         let window = view.window
 
+        let backingScale = view.window?.backingScaleFactor ?? 2.0
+
         return workspaces.map { workspace in
+            let frameInGrid = gridView.frameForWorkspaceInGrid(workspace.id)
             let targetFPS: Double
             if unlockFPSIfInteractingEnabled, interactionUnlockDisplayID == workspace.displayID {
                 targetFPS = max(clampedFPSLimit(fpsLimitValue), defaultVisibleDisplayFPS)
             } else if !windowVisible {
-                targetFPS = backgroundDisplayFPS
-            } else if let frameInGrid = gridView.frameForWorkspaceInGrid(workspace.id) {
+                targetFPS = stoppedDisplayFPS
+            } else if let frameInGrid {
                 let visibleRect = frameInGrid.intersection(viewport)
                 let isVisibleInViewport = !visibleRect.isNull && visibleRect.width > 1.0 && visibleRect.height > 1.0
                 if !isVisibleInViewport {
-                    targetFPS = offscreenDisplayFPS
+                    targetFPS = stoppedDisplayFPS
                 } else if let window, isWorkspaceLikelyOccludedByOtherWindow(frameInGrid: frameInGrid, window: window) {
                     targetFPS = offscreenDisplayFPS
                 } else {
@@ -812,17 +820,53 @@ final class WorkspaceRootViewController: NSViewController {
                     )
                 }
             } else {
-                targetFPS = offscreenDisplayFPS
+                targetFPS = stoppedDisplayFPS
             }
 
             return DisplayDescriptor(
                 displayID: workspace.displayID,
                 title: workspace.title,
                 pixelSize: workspace.displayPixelSize,
+                captureSize: captureSize(
+                    for: workspace,
+                    frameInGrid: frameInGrid,
+                    backingScale: backingScale
+                ),
                 kind: workspace.kind,
-                maxFPS: targetFPS
+                maxFPS: quantizedFPS(targetFPS)
             )
         }
+    }
+
+    /// Ask the stream for the pixels the canvas actually draws. A tile shown at
+    /// 360x270pt does not need a 3200x2400 surface.
+    private func captureSize(
+        for workspace: Workspace,
+        frameInGrid: CGRect?,
+        backingScale: CGFloat
+    ) -> CGSize {
+        guard let frameInGrid, frameInGrid.width > 1.0, frameInGrid.height > 1.0 else {
+            return CaptureScale.captureSize(
+                nativePixelSize: workspace.displayPixelSize,
+                presentationSize: .zero
+            )
+        }
+        let presentation = CGSize(
+            width: frameInGrid.width * backingScale,
+            height: frameInGrid.height * backingScale
+        )
+        return CaptureScale.captureSize(
+            nativePixelSize: workspace.displayPixelSize,
+            presentationSize: presentation
+        )
+    }
+
+    /// Snap to a few steps: every distinct value tears down and recreates the stream,
+    /// and the coverage heuristic otherwise jitters across neighbouring values.
+    private func quantizedFPS(_ fps: Double) -> Double {
+        guard fps > 0.0 else { return 0.0 }
+        let steps: [Double] = [1, 2, 5, 10, 15, 24, 30, 45, 60, 90, 120]
+        return steps.first { fps <= $0 + 0.0001 } ?? steps[steps.count - 1]
     }
 
     private func effectiveVisibleDisplayFPS(
@@ -886,6 +930,8 @@ final class WorkspaceRootViewController: NSViewController {
             hasher.combine(Int(descriptor.displayID))
             hasher.combine(Int(descriptor.pixelSize.width.rounded()))
             hasher.combine(Int(descriptor.pixelSize.height.rounded()))
+            hasher.combine(Int(descriptor.captureSize.width.rounded()))
+            hasher.combine(Int(descriptor.captureSize.height.rounded()))
             hasher.combine(Int((descriptor.maxFPS * 100.0).rounded()))
         }
         let signed = Int64(hasher.finalize())
@@ -2447,17 +2493,15 @@ final class WorkspaceRootViewController: NSViewController {
         return FullscreenTarget(workspace: workspace, normalizedPoint: normalizedPoint)
     }
 
-    private func maybeRefreshDisplayPixelSizeFromSystem(displayID: CGDirectDisplayID, surface: IOSurface) {
+    private func maybeRefreshDisplayPixelSizeFromSystem(displayID: CGDirectDisplayID) {
         let now = ProcessInfo.processInfo.systemUptime
         let lastProbe = lastDisplayModeProbeTime[displayID] ?? 0
         guard now - lastProbe >= 0.35 else { return }
         lastDisplayModeProbeTime[displayID] = now
 
-        let fallbackSize = CGSize(
-            width: CGFloat(IOSurfaceGetWidth(surface)),
-            height: CGFloat(IOSurfaceGetHeight(surface))
-        )
-        let pixelSize = systemDisplayPixelSize(for: displayID) ?? fallbackSize
+        // Deliberately no IOSurface fallback: the surface is now downscaled to the
+        // presentation size, so its dimensions are not the display's resolution.
+        guard let pixelSize = systemDisplayPixelSize(for: displayID) else { return }
         guard pixelSize.width > 1, pixelSize.height > 1 else { return }
 
         guard workspaceStore.updateDisplayPixelSize(displayID: displayID, pixelSize: pixelSize) != nil else {

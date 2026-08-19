@@ -10,6 +10,7 @@
 		C7D588F7DF7BE2CFC9DD659F /* ArrangeMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = BEDD0E095668BD7F5F203134 /* ArrangeMode.swift */; };
 		0DB8656121C2AB6DF756C2BC /* ArrangeSettingsWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9FA97ACA6DA778A6EB83742C /* ArrangeSettingsWindowController.swift */; };
 		4F3A5D8DAD6F41E7A1B202C1 /* LimitFPSSettingsWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7C2E9B5DA9644F3B8A1D4EE0 /* LimitFPSSettingsWindowController.swift */; };
+		1A7C4E20B3D14F0C9E5A6017 /* CaptureScale.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A7C4E20B3D14F0C9E5A6018 /* CaptureScale.swift */; };
 		1A7C4E20B3D14F0C9E5A6015 /* FrontmostAppProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A7C4E20B3D14F0C9E5A6016 /* FrontmostAppProbe.swift */; };
 		1A7C4E20B3D14F0C9E5A6013 /* DisplayPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A7C4E20B3D14F0C9E5A6014 /* DisplayPanelView.swift */; };
 		1A7C4E20B3D14F0C9E5A6011 /* DisplayResolutionSettingsWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A7C4E20B3D14F0C9E5A6012 /* DisplayResolutionSettingsWindowController.swift */; };
@@ -53,6 +54,7 @@
 		BEDD0E095668BD7F5F203134 /* ArrangeMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ArrangeMode.swift; sourceTree = "<group>"; };
 		9FA97ACA6DA778A6EB83742C /* ArrangeSettingsWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ArrangeSettingsWindowController.swift; sourceTree = "<group>"; };
 		7C2E9B5DA9644F3B8A1D4EE0 /* LimitFPSSettingsWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LimitFPSSettingsWindowController.swift; sourceTree = "<group>"; };
+		1A7C4E20B3D14F0C9E5A6018 /* CaptureScale.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureScale.swift; sourceTree = "<group>"; };
 		1A7C4E20B3D14F0C9E5A6016 /* FrontmostAppProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FrontmostAppProbe.swift; sourceTree = "<group>"; };
 		1A7C4E20B3D14F0C9E5A6014 /* DisplayPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DisplayPanelView.swift; sourceTree = "<group>"; };
 		1A7C4E20B3D14F0C9E5A6012 /* DisplayResolutionSettingsWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DisplayResolutionSettingsWindowController.swift; sourceTree = "<group>"; };
@@ -142,6 +144,7 @@
 				BEDD0E095668BD7F5F203134 /* ArrangeMode.swift */,
 				9FA97ACA6DA778A6EB83742C /* ArrangeSettingsWindowController.swift */,
 				7C2E9B5DA9644F3B8A1D4EE0 /* LimitFPSSettingsWindowController.swift */,
+				1A7C4E20B3D14F0C9E5A6018 /* CaptureScale.swift */,
 				1A7C4E20B3D14F0C9E5A6016 /* FrontmostAppProbe.swift */,
 				1A7C4E20B3D14F0C9E5A6014 /* DisplayPanelView.swift */,
 				1A7C4E20B3D14F0C9E5A6012 /* DisplayResolutionSettingsWindowController.swift */,
@@ -311,6 +314,7 @@
 				C7D588F7DF7BE2CFC9DD659F /* ArrangeMode.swift in Sources */,
 				0DB8656121C2AB6DF756C2BC /* ArrangeSettingsWindowController.swift in Sources */,
 				4F3A5D8DAD6F41E7A1B202C1 /* LimitFPSSettingsWindowController.swift in Sources */,
+				1A7C4E20B3D14F0C9E5A6017 /* CaptureScale.swift in Sources */,
 				1A7C4E20B3D14F0C9E5A6015 /* FrontmostAppProbe.swift in Sources */,
 				1A7C4E20B3D14F0C9E5A6013 /* DisplayPanelView.swift in Sources */,
 				1A7C4E20B3D14F0C9E5A6011 /* DisplayResolutionSettingsWindowController.swift in Sources */,
