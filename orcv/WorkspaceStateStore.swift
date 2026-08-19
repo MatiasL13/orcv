@@ -47,6 +47,7 @@ struct PersistedWorkspaceState: Codable {
     var unlockFPSIfInteracting: Bool?
     var unlockFPSIfLargerThanPercent: Bool?
     var unlockFPSLargerThanPercentThreshold: Double?
+    var showDisplayPanel: Bool?
     var defaultDisplayWidth: Int?
     var defaultDisplayHeight: Int?
     var defaultDisplayHiDPI: Bool?

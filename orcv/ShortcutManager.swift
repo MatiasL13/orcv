@@ -13,6 +13,7 @@ enum ShortcutAction: String, CaseIterable {
     case hideWindow = "hide_window"
     case navigateBack = "navigate_back"
     case navigateForward = "navigate_forward"
+    case toggleDisplayPanel = "toggle_display_panel"
 
     var title: String {
         switch self {
@@ -27,6 +28,7 @@ enum ShortcutAction: String, CaseIterable {
         case .hideWindow: return "Hide Window"
         case .navigateBack: return "Navigate Back"
         case .navigateForward: return "Navigate Forward"
+        case .toggleDisplayPanel: return "Toggle Displays Panel"
         }
     }
 
@@ -43,6 +45,7 @@ enum ShortcutAction: String, CaseIterable {
         case .hideWindow: return "cmd+h"
         case .navigateBack: return "cmd+["
         case .navigateForward: return "cmd+]"
+        case .toggleDisplayPanel: return "cmd+d"
         }
     }
 }

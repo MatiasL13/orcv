@@ -184,6 +184,35 @@ final class OrcvGridView: NSView {
         syncTileLayers()
     }
 
+    /// Crosshair over the canvas, so the plain arrow means "the pointer is inside a
+    /// virtual display" (that cursor belongs to the app running there and cannot be
+    /// changed from here). `.activeAlways` because the orcv window is usually unfocused.
+    var canvasCursor: NSCursor = .crosshair {
+        didSet {
+            guard canvasCursor != oldValue else { return }
+            canvasCursor.set()
+        }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas where area.owner === self {
+            removeTrackingArea(area)
+        }
+        addTrackingArea(
+            NSTrackingArea(
+                rect: .zero,
+                options: [.cursorUpdate, .activeAlways, .inVisibleRect],
+                owner: self,
+                userInfo: nil
+            )
+        )
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        canvasCursor.set()
+    }
+
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
 

@@ -19,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var requireHoldingMoveShortcutMenuItem: NSMenuItem?
     private var swapResizeBehaviorMenuItem: NSMenuItem?
     private var sharpCornersMenuItem: NSMenuItem?
+    private var displayPanelMenuItem: NSMenuItem?
     private var windowVisibilityMenuItem: NSMenuItem?
     private var autoArrangeOffItem: NSMenuItem?
     private var autoArrangeColumnItem: NSMenuItem?
@@ -281,6 +282,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         sharpCornersItem.state = .off
         sharpCornersMenuItem = sharpCornersItem
         viewMenu.addItem(sharpCornersItem)
+
+        let displayPanelItem = NSMenuItem(
+            title: "Show Displays Panel",
+            action: #selector(toggleDisplayPanel(_:)),
+            keyEquivalent: ""
+        )
+        displayPanelItem.target = self
+        displayPanelItem.state = .on
+        displayPanelMenuItem = displayPanelItem
+        viewMenu.addItem(displayPanelItem)
 
         let limitFPSSettingsItem = NSMenuItem(
             title: "Limit FPS Settings…",
@@ -772,6 +783,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     @objc
+    private func toggleDisplayPanel(_ sender: Any?) {
+        _ = sender
+        rootViewController?.menuToggleDisplayPanel()
+        refreshDisplayPanelMenuState()
+    }
+
+    func refreshDisplayPanelMenuState() {
+        displayPanelMenuItem?.state = rootViewController?.menuDisplayPanelVisible() == true ? .on : .off
+    }
+
+    @objc
     private func showDisplayResolutionSettings(_ sender: Any?) {
         _ = sender
         guard let rootViewController else { return }
@@ -919,6 +941,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         requireHoldingMoveShortcutMenuItem?.state = rootViewController?.menuRequireHoldingMoveShortcutEnabled() == true ? .on : .off
         swapResizeBehaviorMenuItem?.state = rootViewController?.menuSwapResizeBehaviorEnabled() == true ? .on : .off
         sharpCornersMenuItem?.state = rootViewController?.menuSharpCornersEnabled() == true ? .on : .off
+        refreshDisplayPanelMenuState()
         DispatchQueue.main.async { [weak self] in
             guard let window = self?.window else { return }
             self?.applyChromelessWindowStyle(window)
@@ -930,6 +953,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             self?.requireHoldingMoveShortcutMenuItem?.state = self?.rootViewController?.menuRequireHoldingMoveShortcutEnabled() == true ? .on : .off
             self?.swapResizeBehaviorMenuItem?.state = self?.rootViewController?.menuSwapResizeBehaviorEnabled() == true ? .on : .off
             self?.sharpCornersMenuItem?.state = self?.rootViewController?.menuSharpCornersEnabled() == true ? .on : .off
+            self?.refreshDisplayPanelMenuState()
         }
         NSApp.activate(ignoringOtherApps: true)
     }
