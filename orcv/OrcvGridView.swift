@@ -98,6 +98,7 @@ final class OrcvGridView: NSView {
     }
 
     var onFocusRequest: ((UUID, CGPoint, CGRect, NSEvent.ModifierFlags) -> Void)?
+    var onEnterWorkspaceRequest: ((UUID, CGPoint, CGRect) -> Void)?
     var onBackgroundClick: (() -> Void)?
     var onReorderCommit: (([UUID]) -> Void)?
     var onCanvasMoveCommit: ((_ workspaceID: UUID, _ newOrigin: CGPoint, _ oldOrigin: CGPoint?) -> Void)?
@@ -184,6 +185,41 @@ final class OrcvGridView: NSView {
         syncTileLayers()
     }
 
+    /// Crosshair over the canvas, so the plain arrow means "the pointer is inside a
+    /// virtual display" (that cursor belongs to the app running there and cannot be
+    /// changed from here). `.activeAlways` because the orcv window is usually unfocused.
+    var canvasCursor: NSCursor = .crosshair {
+        didSet {
+            guard canvasCursor != oldValue else { return }
+            canvasCursor.set()
+        }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas where area.owner === self {
+            removeTrackingArea(area)
+        }
+        addTrackingArea(
+            NSTrackingArea(
+                rect: .zero,
+                options: [.cursorUpdate, .activeAlways, .inVisibleRect],
+                owner: self,
+                userInfo: nil
+            )
+        )
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        canvasCursor.set()
+    }
+
+    // The orcv window is usually unfocused. Without this the first click is swallowed
+    // by activation, which would also make two separate clicks arrive as a double click.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
 
@@ -198,6 +234,10 @@ final class OrcvGridView: NSView {
                   frame.contains(point) else { continue }
 
             let pointInTile = CGPoint(x: point.x - frame.minX, y: point.y - frame.minY)
+            if event.clickCount == 2, !isSelectionToggleClick {
+                onEnterWorkspaceRequest?(workspace.id, pointInTile, frame)
+                return
+            }
             if isSelectionToggleClick {
                 onFocusRequest?(workspace.id, pointInTile, frame, modifiers)
                 return

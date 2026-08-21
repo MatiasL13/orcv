@@ -55,6 +55,12 @@ final class WorkspaceRootViewController: NSViewController {
     private var globalSwipeMonitor: Any?
     private var localCanvasScrollMonitor: Any?
     private var globalCanvasScrollMonitor: Any?
+    private let displayPanel = DisplayPanelView()
+    private var displayPanelSubtitles: [UUID: String] = [:]
+    private var displayPanelSubtitleTimer: Timer?
+    private var localMiddleDragMonitor: Any?
+    private var globalMiddleDragMonitor: Any?
+    private var isMiddleDragPanning = false
     private var localMagnifyMonitor: Any?
     private var globalMagnifyMonitor: Any?
     private var canvasCameraSaveDebounceWorkItem: DispatchWorkItem?
@@ -106,7 +112,13 @@ final class WorkspaceRootViewController: NSViewController {
     private var unlockFPSIfInteractingEnabled = true
     private var unlockFPSIfLargerThanPercentEnabled = false
     private var unlockFPSLargerThanPercentThreshold: Double = 70.0
+    /// The display that should keep the menu bar and the Dock. Tracked because a newly
+    /// created virtual display can land on the global origin and take them over.
+    private var preferredMainDisplayID: CGDirectDisplayID?
+    private var didAnnounceTeleportExitHint = false
     private(set) var arrangePadding: CGFloat = 2.0
+    /// nil = mirror the main display (default). Otherwise the logical size used for new virtual displays.
+    private var defaultDisplayResolution: DisplayResolution?
     private(set) var autoArrangeMode: ArrangeMode?
     private var pendingScrollZoomDelta: CGFloat = 0.0
     private var shiftPanAxisLock: ShiftPanAxisLock?
@@ -114,6 +126,8 @@ final class WorkspaceRootViewController: NSViewController {
     private var lastDisplayDescriptorSignature: UInt64?
     private let defaultVisibleDisplayFPS: Double = 60.0
     private let offscreenDisplayFPS: Double = 2.0
+    /// Zero tells the stream manager to stop capturing entirely.
+    private let stoppedDisplayFPS: Double = 0.0
     private let backgroundDisplayFPS: Double = 1.0
     private var cameraHistory: [CameraHistoryEntry] = []
     private var cameraHistoryCursor: Int = -1
@@ -154,6 +168,12 @@ final class WorkspaceRootViewController: NSViewController {
         if let localCanvasScrollMonitor {
             NSEvent.removeMonitor(localCanvasScrollMonitor)
         }
+        if let localMiddleDragMonitor {
+            NSEvent.removeMonitor(localMiddleDragMonitor)
+        }
+        if let globalMiddleDragMonitor {
+            NSEvent.removeMonitor(globalMiddleDragMonitor)
+        }
         if let globalCanvasScrollMonitor {
             NSEvent.removeMonitor(globalCanvasScrollMonitor)
         }
@@ -167,6 +187,7 @@ final class WorkspaceRootViewController: NSViewController {
         streamRefreshWorkItem?.cancel()
         immersiveTeleportWorkItem?.cancel()
         windowLevelPollingTimer?.invalidate()
+        displayPanelSubtitleTimer?.invalidate()
         spaceFollowWindowTimer?.invalidate()
         setMoveCursorActive(false)
         teardownStreamVisibilityObservers()
@@ -264,6 +285,9 @@ final class WorkspaceRootViewController: NSViewController {
         view.addSubview(emptyStateLabel)
         view.addSubview(tileStatusOverlay)
         view.addSubview(toastContainer)
+        displayPanel.translatesAutoresizingMaskIntoConstraints = false
+        displayPanel.isHidden = true
+        view.addSubview(displayPanel)
 
         NSLayoutConstraint.activate([
             canvasBackdropView.topAnchor.constraint(equalTo: view.topAnchor),
@@ -298,6 +322,9 @@ final class WorkspaceRootViewController: NSViewController {
             toastLabel.bottomAnchor.constraint(equalTo: toastContainer.bottomAnchor, constant: -16),
             toastLabel.leadingAnchor.constraint(equalTo: toastContainer.leadingAnchor, constant: 24),
             toastLabel.trailingAnchor.constraint(equalTo: toastContainer.trailingAnchor, constant: -24),
+
+            displayPanel.topAnchor.constraint(equalTo: view.topAnchor, constant: 44),
+            displayPanel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
         ])
 
         applyInteractionMode()
@@ -326,6 +353,22 @@ final class WorkspaceRootViewController: NSViewController {
             } else {
                 self.workspaceStore.selectOnly(workspaceID: workspaceID)
             }
+        }
+
+        displayPanel.onSelect = { [weak self] workspaceID in
+            self?.jumpToWorkspace(workspaceID: workspaceID)
+        }
+
+        displayPanel.onRename = { [weak self] workspaceID, title in
+            self?.workspaceStore.renameWorkspace(id: workspaceID, title: title)
+        }
+
+        gridView.onEnterWorkspaceRequest = { [weak self] workspaceID, pointInTile, frameInGrid in
+            self?.teleportIntoWorkspace(
+                workspaceID: workspaceID,
+                pointInTile: pointInTile,
+                frameInGrid: frameInGrid
+            )
         }
 
         gridView.onBackgroundClick = { [weak self] in
@@ -373,7 +416,7 @@ final class WorkspaceRootViewController: NSViewController {
         streamManager.onDisplayFrame = { [weak self] displayID, surface in
             self?.gridView.refreshPreviews(for: displayID)
             self?.previewWindowController.consumeFrame(displayID: displayID, surface: surface)
-            self?.maybeRefreshDisplayPixelSizeFromSystem(displayID: displayID, surface: surface)
+            self?.maybeRefreshDisplayPixelSizeFromSystem(displayID: displayID)
         }
 
         streamManager.onError = { [weak self] message in
@@ -389,6 +432,7 @@ final class WorkspaceRootViewController: NSViewController {
         installSwipeMonitorsIfNeeded()
         installMagnificationMonitorIfNeeded()
         installCanvasScrollMonitorsIfNeeded()
+        installMiddleDragMonitorsIfNeeded()
         updateEmptyStateCallout()
     }
 
@@ -416,6 +460,60 @@ final class WorkspaceRootViewController: NSViewController {
         previewWindowController.closeIfDisplayMissing(validDisplayIDs: validDisplayIDs)
         refreshGridWindowLevelForPointerMapping()
         scheduleDisplayStreamRefresh()
+        refreshDisplayPanel()
+    }
+
+    private func refreshDisplayPanel() {
+        let items = workspaceStore.workspaces
+            .filter { $0.kind == .virtual }
+            .map { workspace in
+                DisplayPanelItem(
+                    workspaceID: workspace.id,
+                    title: workspace.title,
+                    subtitle: displayPanelSubtitles[workspace.id] ?? "",
+                    colorSeed: displayManager.virtualDisplaySerial(for: workspace.displayID)
+                        ?? workspace.displayID,
+                    isFocused: workspace.id == workspaceStore.focusedWorkspaceID
+                )
+            }
+        displayPanel.apply(items: items)
+    }
+
+    private func refreshDisplayPanelSubtitles() {
+        let virtual = workspaceStore.workspaces.filter { $0.kind == .virtual }
+        guard !virtual.isEmpty else {
+            displayPanelSubtitles = [:]
+            return
+        }
+        let namesByDisplayID = FrontmostAppProbe.ownerNamesByDisplayID(virtual.map(\.displayID))
+        var subtitles: [UUID: String] = [:]
+        for workspace in virtual {
+            subtitles[workspace.id] = namesByDisplayID[workspace.displayID] ?? ""
+        }
+        guard subtitles != displayPanelSubtitles else { return }
+        displayPanelSubtitles = subtitles
+        refreshDisplayPanel()
+    }
+
+    private func setDisplayPanelVisible(_ visible: Bool) {
+        displayPanel.isHiddenByUser = !visible
+        if visible {
+            refreshDisplayPanelSubtitles()
+            refreshDisplayPanel()
+            installDisplayPanelSubtitleTimerIfNeeded()
+        } else {
+            displayPanelSubtitleTimer?.invalidate()
+            displayPanelSubtitleTimer = nil
+        }
+    }
+
+    private func installDisplayPanelSubtitleTimerIfNeeded() {
+        guard displayPanelSubtitleTimer == nil else { return }
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.refreshDisplayPanelSubtitles()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        displayPanelSubtitleTimer = timer
     }
 
     private func installStreamVisibilityObserversIfNeeded() {
@@ -671,7 +769,12 @@ final class WorkspaceRootViewController: NSViewController {
             NSSound.beep()
             return
         }
-        registerUndoForDelete(removed: removed.workspace, index: removed.index, actionName: "Remove Display")
+        registerUndoForDelete(
+            removed: removed.workspace,
+            index: removed.index,
+            resolution: removed.resolution,
+            actionName: "Remove Display"
+        )
         autoArrangeIfNeeded()
     }
 
@@ -689,12 +792,15 @@ final class WorkspaceRootViewController: NSViewController {
                 interactionUnlockForDisplay: interactionUnlockDisplayID == immersiveDisplayID
             )
             return workspaces.map { workspace in
-                DisplayDescriptor(
+                let isImmersive = workspace.displayID == immersiveDisplayID
+                return DisplayDescriptor(
                     displayID: workspace.displayID,
                     title: workspace.title,
                     pixelSize: workspace.displayPixelSize,
+                    // The immersive window fills a whole screen, so it needs native pixels.
+                    captureSize: isImmersive ? workspace.displayPixelSize : nil,
                     kind: workspace.kind,
-                    maxFPS: workspace.displayID == immersiveDisplayID ? immersiveFPS : backgroundDisplayFPS
+                    maxFPS: isImmersive ? immersiveFPS : stoppedDisplayFPS
                 )
             }
         }
@@ -702,17 +808,20 @@ final class WorkspaceRootViewController: NSViewController {
         let windowVisible = isOrcvWindowVisibleForCapture()
         let window = view.window
 
+        let backingScale = view.window?.backingScaleFactor ?? 2.0
+
         return workspaces.map { workspace in
+            let frameInGrid = gridView.frameForWorkspaceInGrid(workspace.id)
             let targetFPS: Double
             if unlockFPSIfInteractingEnabled, interactionUnlockDisplayID == workspace.displayID {
                 targetFPS = max(clampedFPSLimit(fpsLimitValue), defaultVisibleDisplayFPS)
             } else if !windowVisible {
-                targetFPS = backgroundDisplayFPS
-            } else if let frameInGrid = gridView.frameForWorkspaceInGrid(workspace.id) {
+                targetFPS = stoppedDisplayFPS
+            } else if let frameInGrid {
                 let visibleRect = frameInGrid.intersection(viewport)
                 let isVisibleInViewport = !visibleRect.isNull && visibleRect.width > 1.0 && visibleRect.height > 1.0
                 if !isVisibleInViewport {
-                    targetFPS = offscreenDisplayFPS
+                    targetFPS = stoppedDisplayFPS
                 } else if let window, isWorkspaceLikelyOccludedByOtherWindow(frameInGrid: frameInGrid, window: window) {
                     targetFPS = offscreenDisplayFPS
                 } else {
@@ -723,17 +832,53 @@ final class WorkspaceRootViewController: NSViewController {
                     )
                 }
             } else {
-                targetFPS = offscreenDisplayFPS
+                targetFPS = stoppedDisplayFPS
             }
 
             return DisplayDescriptor(
                 displayID: workspace.displayID,
                 title: workspace.title,
                 pixelSize: workspace.displayPixelSize,
+                captureSize: captureSize(
+                    for: workspace,
+                    frameInGrid: frameInGrid,
+                    backingScale: backingScale
+                ),
                 kind: workspace.kind,
-                maxFPS: targetFPS
+                maxFPS: quantizedFPS(targetFPS)
             )
         }
+    }
+
+    /// Ask the stream for the pixels the canvas actually draws. A tile shown at
+    /// 360x270pt does not need a 3200x2400 surface.
+    private func captureSize(
+        for workspace: Workspace,
+        frameInGrid: CGRect?,
+        backingScale: CGFloat
+    ) -> CGSize {
+        guard let frameInGrid, frameInGrid.width > 1.0, frameInGrid.height > 1.0 else {
+            return CaptureScale.captureSize(
+                nativePixelSize: workspace.displayPixelSize,
+                presentationSize: .zero
+            )
+        }
+        let presentation = CGSize(
+            width: frameInGrid.width * backingScale,
+            height: frameInGrid.height * backingScale
+        )
+        return CaptureScale.captureSize(
+            nativePixelSize: workspace.displayPixelSize,
+            presentationSize: presentation
+        )
+    }
+
+    /// Snap to a few steps: every distinct value tears down and recreates the stream,
+    /// and the coverage heuristic otherwise jitters across neighbouring values.
+    private func quantizedFPS(_ fps: Double) -> Double {
+        guard fps > 0.0 else { return 0.0 }
+        let steps: [Double] = [1, 2, 5, 10, 15, 24, 30, 45, 60, 90, 120]
+        return steps.first { fps <= $0 + 0.0001 } ?? steps[steps.count - 1]
     }
 
     private func effectiveVisibleDisplayFPS(
@@ -797,6 +942,8 @@ final class WorkspaceRootViewController: NSViewController {
             hasher.combine(Int(descriptor.displayID))
             hasher.combine(Int(descriptor.pixelSize.width.rounded()))
             hasher.combine(Int(descriptor.pixelSize.height.rounded()))
+            hasher.combine(Int(descriptor.captureSize.width.rounded()))
+            hasher.combine(Int(descriptor.captureSize.height.rounded()))
             hasher.combine(Int((descriptor.maxFPS * 100.0).rounded()))
         }
         let signed = Int64(hasher.finalize())
@@ -942,6 +1089,15 @@ final class WorkspaceRootViewController: NSViewController {
         scheduleStateSave()
     }
 
+    func menuToggleDisplayPanel() {
+        setDisplayPanelVisible(displayPanel.isHiddenByUser)
+        scheduleStateSave()
+    }
+
+    func menuDisplayPanelVisible() -> Bool {
+        !displayPanel.isHiddenByUser
+    }
+
     func menuSharpCornersEnabled() -> Bool {
         gridView.sharpCornersEnabled
     }
@@ -960,6 +1116,15 @@ final class WorkspaceRootViewController: NSViewController {
 
     func menuAutoArrangeMode() -> ArrangeMode? {
         autoArrangeMode
+    }
+
+    func menuDefaultDisplayResolution() -> DisplayResolution? {
+        defaultDisplayResolution
+    }
+
+    func menuSetDefaultDisplayResolution(_ resolution: DisplayResolution?) {
+        defaultDisplayResolution = resolution
+        scheduleStateSave()
     }
 
     func menuArrangePadding() -> CGFloat {
@@ -1099,11 +1264,26 @@ final class WorkspaceRootViewController: NSViewController {
         let title: String
         let tileSize: CGSize
         let index: Int
+        let resolution: DisplayResolution?
     }
 
     @discardableResult
-    private func createVirtualWorkspace(name: String, tileSize: CGSize?, at index: Int?) -> Workspace? {
-        let profile = displayManager.mainDisplayProfile()
+    private func newDisplayProfile() -> VirtualDisplayManager.DisplayProfile {
+        guard let resolution = defaultDisplayResolution else {
+            return displayManager.mainDisplayProfile()
+        }
+        return displayManager.profile(width: resolution.width, height: resolution.height, hiDPI: resolution.hiDPI)
+    }
+
+    private func createVirtualWorkspace(
+        name: String,
+        tileSize: CGSize?,
+        at index: Int?,
+        resolution: DisplayResolution? = nil
+    ) -> Workspace? {
+        let profile = resolution.map {
+            displayManager.profile(width: $0.width, height: $0.height, hiDPI: $0.hiDPI)
+        } ?? newDisplayProfile()
         guard let descriptor = displayManager.createVirtualDisplay(
             name: name,
             width: profile.width,
@@ -1114,18 +1294,24 @@ final class WorkspaceRootViewController: NSViewController {
             return nil
         }
 
-        let created = workspaceStore.addWorkspace(from: descriptor, tileSize: tileSize, at: index)
+        let normalizedTileSize = tileSize.map {
+            TileGeometry.normalizedSizeFromWidth(pixelSize: descriptor.pixelSize, targetWidth: $0.width)
+        }
+        let created = workspaceStore.addWorkspace(from: descriptor, tileSize: normalizedTileSize, at: index)
         scheduleDisplayStreamRefresh(immediate: true, force: true)
         scheduleArrangementSync()
         return created
     }
 
     @discardableResult
-    private func removeVirtualWorkspace(workspaceID: UUID) -> (workspace: Workspace, index: Int)? {
+    private func removeVirtualWorkspace(
+        workspaceID: UUID
+    ) -> (workspace: Workspace, index: Int, resolution: DisplayResolution?)? {
         guard let workspace = workspaceStore.workspace(with: workspaceID),
               workspace.kind == .virtual else {
             return nil
         }
+        let resolution = displayManager.virtualDisplayProfile(for: workspace.displayID).map(DisplayResolution.init)
         guard displayManager.removeVirtualDisplay(displayID: workspace.displayID) else {
             return nil
         }
@@ -1134,29 +1320,41 @@ final class WorkspaceRootViewController: NSViewController {
         }
         scheduleDisplayStreamRefresh(immediate: true, force: true)
         scheduleArrangementSync()
-        return removed
+        return (removed.workspace, removed.index, resolution)
     }
 
     private func registerUndoForCreate(workspaceID: UUID, actionName: String) {
         actionUndoManager.registerUndo(withTarget: self) { target in
             guard let removed = target.removeVirtualWorkspace(workspaceID: workspaceID) else { return }
-            target.registerUndoForDelete(removed: removed.workspace, index: removed.index, actionName: actionName)
+            target.registerUndoForDelete(
+                removed: removed.workspace,
+                index: removed.index,
+                resolution: removed.resolution,
+                actionName: actionName
+            )
             target.autoArrangeIfNeeded()
         }
         actionUndoManager.setActionName(actionName)
     }
 
-    private func registerUndoForDelete(removed: Workspace, index: Int, actionName: String) {
+    private func registerUndoForDelete(
+        removed: Workspace,
+        index: Int,
+        resolution: DisplayResolution?,
+        actionName: String
+    ) {
         let snapshot = DeletedWorkspaceSnapshot(
             title: removed.title,
             tileSize: removed.tileSize,
-            index: index
+            index: index,
+            resolution: resolution
         )
         actionUndoManager.registerUndo(withTarget: self) { target in
             guard let recreated = target.createVirtualWorkspace(
                 name: snapshot.title,
                 tileSize: snapshot.tileSize,
-                at: snapshot.index
+                at: snapshot.index,
+                resolution: snapshot.resolution
             ) else { return }
             target.registerUndoForCreate(workspaceID: recreated.id, actionName: actionName)
             target.autoArrangeIfNeeded()
@@ -1426,6 +1624,70 @@ final class WorkspaceRootViewController: NSViewController {
         }
     }
 
+    private func installMiddleDragMonitorsIfNeeded() {
+        let mask: NSEvent.EventTypeMask = [.otherMouseDown, .otherMouseDragged, .otherMouseUp]
+        if localMiddleDragMonitor == nil {
+            localMiddleDragMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
+                guard let self else { return event }
+                let consumed = self.handleMiddleDragEvent(event, requireUnfocusedWindow: false)
+                return consumed ? nil : event
+            }
+        }
+        guard globalMiddleDragMonitor == nil else { return }
+        globalMiddleDragMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] event in
+            DispatchQueue.main.async {
+                _ = self?.handleMiddleDragEvent(event, requireUnfocusedWindow: true)
+            }
+        }
+    }
+
+    /// Middle-button drag pans the canvas, so navigating between tiles does not require
+    /// modifier + scroll. Only fires while the pointer is directly over the canvas window,
+    /// which is never the case once the pointer has been routed into a virtual display.
+    @discardableResult
+    private func handleMiddleDragEvent(_ event: NSEvent, requireUnfocusedWindow: Bool) -> Bool {
+        guard event.buttonNumber == 2 else { return false }
+
+        if event.type == .otherMouseUp {
+            guard isMiddleDragPanning else { return false }
+            endMiddleDragPan()
+            return true
+        }
+
+        guard currentLayoutMode == .canvas else { return false }
+        guard let window = view.window, window.isVisible else { return false }
+        if requireUnfocusedWindow, isOrcvWindowFocused() {
+            return false
+        }
+
+        if event.type == .otherMouseDown {
+            guard !workspaceStore.workspaces.isEmpty else { return false }
+            let mouseInScreen = NSEvent.mouseLocation
+            guard isPointerDirectlyOverWindow(window: window, screenPoint: mouseInScreen) else { return false }
+            guard !isPointerOverDisplayPanel(window: window, screenPoint: mouseInScreen) else { return false }
+            let mouseInGrid = gridView.convert(window.convertPoint(fromScreen: mouseInScreen), from: nil)
+            guard gridView.bounds.contains(mouseInGrid) else { return false }
+            beginMiddleDragPan()
+            return true
+        }
+
+        guard isMiddleDragPanning else { return false }
+        _ = applyCanvasPan(deltaX: event.deltaX, deltaY: event.deltaY)
+        return true
+    }
+
+    private func beginMiddleDragPan() {
+        guard !isMiddleDragPanning else { return }
+        isMiddleDragPanning = true
+        gridView.canvasCursor = .closedHand
+    }
+
+    private func endMiddleDragPan() {
+        guard isMiddleDragPanning else { return }
+        isMiddleDragPanning = false
+        gridView.canvasCursor = .crosshair
+    }
+
     @discardableResult
     private func handleCanvasMagnify(_ event: NSEvent, requireUnfocusedWindow: Bool) -> Bool {
         guard currentLayoutMode == .canvas else { return false }
@@ -1436,6 +1698,7 @@ final class WorkspaceRootViewController: NSViewController {
         }
         let mouseInScreen = NSEvent.mouseLocation
         guard isPointerDirectlyOverWindow(window: window, screenPoint: mouseInScreen) else { return false }
+        guard !isPointerOverDisplayPanel(window: window, screenPoint: mouseInScreen) else { return false }
 
         pendingScrollZoomDelta = 0.0
         let delta = event.magnification
@@ -1458,6 +1721,7 @@ final class WorkspaceRootViewController: NSViewController {
 
         let mouseInScreen = NSEvent.mouseLocation
         guard isPointerDirectlyOverWindow(window: window, screenPoint: mouseInScreen) else { return false }
+        guard !isPointerOverDisplayPanel(window: window, screenPoint: mouseInScreen) else { return false }
         let mouseInWindow = window.convertPoint(fromScreen: mouseInScreen)
         let mouseInGrid = gridView.convert(mouseInWindow, from: nil)
         guard gridView.bounds.contains(mouseInGrid) else { return false }
@@ -1667,6 +1931,14 @@ final class WorkspaceRootViewController: NSViewController {
         }
     }
 
+    /// The panel floats inside gridView's bounds, so the canvas gesture monitors
+    /// would otherwise pan and zoom while the pointer is over it.
+    private func isPointerOverDisplayPanel(window: NSWindow, screenPoint: CGPoint) -> Bool {
+        guard !displayPanel.isHidden else { return false }
+        let pointInWindow = window.convertPoint(fromScreen: screenPoint)
+        return displayPanel.frame.contains(view.convert(pointInWindow, from: nil))
+    }
+
     private func isPointerDirectlyOverWindow(window: NSWindow, screenPoint: CGPoint) -> Bool {
         let topWindowNumber = NSWindow.windowNumber(
             at: screenPoint,
@@ -1725,6 +1997,12 @@ final class WorkspaceRootViewController: NSViewController {
     }
 
     private func handleNavigationEvent(_ event: NSEvent) -> Bool {
+        // While a name is being edited the field editor owns the keyboard: otherwise
+        // typing would fire the global shortcuts (cmd+w closes the display, space,
+        // backspace, tab...).
+        if event.type == .keyDown, view.window?.firstResponder is NSTextView {
+            return false
+        }
         let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let shortcutMods = mods.intersection([.control, .option, .command, .shift])
         if event.type == .keyDown {
@@ -1805,6 +2083,10 @@ final class WorkspaceRootViewController: NSViewController {
         case .navigateForward:
             guard isPointerWithinOrcvWindowBounds() else { return false }
             return navigateCameraForward()
+        case .toggleDisplayPanel:
+            menuToggleDisplayPanel()
+            (NSApp.delegate as? AppDelegate)?.refreshDisplayPanelMenuState()
+            return true
         }
     }
 
@@ -1817,6 +2099,8 @@ final class WorkspaceRootViewController: NSViewController {
     private func actionRequiresFocusedWindow(_ action: ShortcutAction) -> Bool {
         switch action {
         case .toggleTeleport, .windowFollowHold, .hideWindow, .navigateBack, .navigateForward, .removeDisplay:
+            return false
+        case .toggleDisplayPanel:
             return false
         case .newDisplay, .fullscreenSelected, .jumpNextDisplay, .jumpPreviousDisplay, .deselectTile:
             return true
@@ -1897,15 +2181,34 @@ final class WorkspaceRootViewController: NSViewController {
         let mouseInScreen = NSEvent.mouseLocation
         let pointInWindow = window.convertPoint(fromScreen: mouseInScreen)
         let pointInGrid = gridView.convert(pointInWindow, from: nil)
-        guard let hit = gridView.hitTestWorkspace(at: pointInGrid),
-              let workspace = workspaceStore.workspace(with: hit.workspaceID) else { return }
+        guard let hit = gridView.hitTestWorkspace(at: pointInGrid) else { return }
+
+        teleportIntoWorkspace(
+            workspaceID: hit.workspaceID,
+            pointInTile: hit.pointInTile,
+            frameInGrid: hit.frameInGrid
+        )
+    }
+
+    private func teleportIntoWorkspace(workspaceID: UUID, pointInTile: CGPoint, frameInGrid: CGRect) {
+        guard let workspace = workspaceStore.workspace(with: workspaceID) else { return }
+        guard workspace.kind == .virtual else { return }
 
         pointerRouter.teleportInto(
             workspace: workspace,
-            pointInTile: hit.pointInTile,
-            tileFrameInWindow: hit.frameInGrid
+            pointInTile: pointInTile,
+            tileFrameInWindow: frameInGrid
         )
         scheduleArrangementSync()
+        announceTeleportExitHintIfNeeded()
+    }
+
+    /// Entering is now discoverable (double click) but leaving is not, so say how once.
+    private func announceTeleportExitHintIfNeeded() {
+        guard !didAnnounceTeleportExitHint else { return }
+        didAnnounceTeleportExitHint = true
+        let shortcut = shortcutManager.displayString(for: .toggleTeleport)
+        showToast("Press \(shortcut) to come back to the canvas")
     }
 
     private func teleportBackFromPresentedPreviewIfNeeded() {
@@ -2013,6 +2316,8 @@ final class WorkspaceRootViewController: NSViewController {
             lastQueuedArrangementSignature = nil
             return
         }
+        // Read on the main thread: compute... refreshed it just above.
+        let mainDisplayID = preferredMainDisplayID
 
         arrangementApplyQueue.async { [weak self] in
             guard let self else { return }
@@ -2021,7 +2326,10 @@ final class WorkspaceRootViewController: NSViewController {
                 shouldApply = (generation == self.arrangementGeneration)
             }
             guard shouldApply else { return }
-            let didApply = self.displayManager.applyDisplayOrigins(finalOrigins)
+            let didApply = self.displayManager.applyDisplayOrigins(
+                finalOrigins,
+                mainDisplayID: mainDisplayID
+            )
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 guard generation == self.arrangementGeneration else { return }
@@ -2044,15 +2352,32 @@ final class WorkspaceRootViewController: NSViewController {
             lastAppliedArrangementSignature = signature
             return
         }
-        if displayManager.applyDisplayOrigins(finalOrigins) {
+        if displayManager.applyDisplayOrigins(finalOrigins, mainDisplayID: preferredMainDisplayID) {
             lastAppliedOrigins = finalOrigins
             lastAppliedArrangementSignature = signature
         }
     }
 
+    /// The user's own choice of main display wins, so this follows `CGMainDisplayID()`
+    /// whenever it points at a real display and only remembers the last real one when a
+    /// virtual display has taken over.
+    private func refreshPreferredMainDisplayID() {
+        let virtualIDs = Set(workspaceStore.workspaces.filter { $0.kind == .virtual }.map(\.displayID))
+        let currentMain = CGMainDisplayID()
+        if !virtualIDs.contains(currentMain) {
+            preferredMainDisplayID = currentMain
+            return
+        }
+        if let remembered = preferredMainDisplayID, !virtualIDs.contains(remembered) {
+            return
+        }
+        preferredMainDisplayID = DisplayQuery.onlineDisplayIDs().first { !virtualIDs.contains($0) }
+    }
+
     private func computeDisplayArrangementOriginsFromGrid() -> [CGDirectDisplayID: CGPoint] {
         let virtualWorkspaces = workspaceStore.workspaces.filter { $0.kind == .virtual }
         guard !virtualWorkspaces.isEmpty else { return [:] }
+        refreshPreferredMainDisplayID()
 
         struct Entry {
             let displayID: CGDirectDisplayID
@@ -2094,7 +2419,16 @@ final class WorkspaceRootViewController: NSViewController {
             let mappedY = displayMinY + (topLeftYForEntry(entry) - tileMinY) * scale
             finalOrigins[entry.displayID] = CGPoint(x: mappedX.rounded(), y: mappedY.rounded())
         }
-        return finalOrigins
+
+        guard let mainDisplayID = preferredMainDisplayID else { return finalOrigins }
+        return DisplayArrangement.shiftClearingMainDisplay(
+            origins: finalOrigins,
+            sizes: Dictionary(
+                entries.map { ($0.displayID, $0.displayBounds.size) },
+                uniquingKeysWith: { first, _ in first }
+            ),
+            mainDisplayRect: CGDisplayBounds(mainDisplayID)
+        )
     }
 
     private func arrangementSignatureForCurrentGrid() -> UInt64? {
@@ -2221,17 +2555,15 @@ final class WorkspaceRootViewController: NSViewController {
         return FullscreenTarget(workspace: workspace, normalizedPoint: normalizedPoint)
     }
 
-    private func maybeRefreshDisplayPixelSizeFromSystem(displayID: CGDirectDisplayID, surface: IOSurface) {
+    private func maybeRefreshDisplayPixelSizeFromSystem(displayID: CGDirectDisplayID) {
         let now = ProcessInfo.processInfo.systemUptime
         let lastProbe = lastDisplayModeProbeTime[displayID] ?? 0
         guard now - lastProbe >= 0.35 else { return }
         lastDisplayModeProbeTime[displayID] = now
 
-        let fallbackSize = CGSize(
-            width: CGFloat(IOSurfaceGetWidth(surface)),
-            height: CGFloat(IOSurfaceGetHeight(surface))
-        )
-        let pixelSize = systemDisplayPixelSize(for: displayID) ?? fallbackSize
+        // Deliberately no IOSurface fallback: the surface is now downscaled to the
+        // presentation size, so its dimensions are not the display's resolution.
+        guard let pixelSize = systemDisplayPixelSize(for: displayID) else { return }
         guard pixelSize.width > 1, pixelSize.height > 1 else { return }
 
         guard workspaceStore.updateDisplayPixelSize(displayID: displayID, pixelSize: pixelSize) != nil else {
@@ -2292,21 +2624,25 @@ final class WorkspaceRootViewController: NSViewController {
         scheduleDisplayStreamRefresh()
     }
 
+    @discardableResult
+    private func jumpToWorkspace(workspaceID: UUID) -> Bool {
+        let sourceWorkspaceID = workspaceStore.focusedWorkspaceID
+        hasUsedAdjacentJumpSinceBootstrap = true
+        workspaceStore.selectOnly(workspaceID: workspaceID)
+        return jumpCameraToWorkspace(
+            workspaceID: workspaceID,
+            fitTile: !preserveSizeOnSlotJumpEnabled,
+            alignTopLeft: !centerTileOnJumpEnabled,
+            preserveViewportOffsetFromWorkspaceID: preserveSizeOnSlotJumpEnabled ? sourceWorkspaceID : nil
+        )
+    }
+
     private func jumpToDisplaySlot(_ slot: Int) -> Bool {
         guard (1...9).contains(slot) else { return false }
         let workspaces = workspaceStore.workspaces
         let index = slot - 1
         guard index >= 0, index < workspaces.count else { return false }
-        let sourceWorkspaceID = workspaceStore.focusedWorkspaceID
-        let target = workspaces[index]
-        hasUsedAdjacentJumpSinceBootstrap = true
-        workspaceStore.selectOnly(workspaceID: target.id)
-        return jumpCameraToWorkspace(
-            workspaceID: target.id,
-            fitWidth: !preserveSizeOnSlotJumpEnabled,
-            alignTopLeft: !centerTileOnJumpEnabled,
-            preserveViewportOffsetFromWorkspaceID: preserveSizeOnSlotJumpEnabled ? sourceWorkspaceID : nil
-        )
+        return jumpToWorkspace(workspaceID: workspaces[index].id)
     }
 
     private func jumpToAdjacentDisplay(step: Int) -> Bool {
@@ -2315,37 +2651,20 @@ final class WorkspaceRootViewController: NSViewController {
         guard step != 0 else { return false }
 
         if !hasUsedAdjacentJumpSinceBootstrap {
-            let sourceWorkspaceID = workspaceStore.focusedWorkspaceID
             let target = step > 0 ? workspaces[0] : workspaces[workspaces.count - 1]
-            hasUsedAdjacentJumpSinceBootstrap = true
-            workspaceStore.selectOnly(workspaceID: target.id)
-            return jumpCameraToWorkspace(
-                workspaceID: target.id,
-                fitWidth: !preserveSizeOnSlotJumpEnabled,
-                alignTopLeft: !centerTileOnJumpEnabled,
-                preserveViewportOffsetFromWorkspaceID: preserveSizeOnSlotJumpEnabled ? sourceWorkspaceID : nil
-            )
+            return jumpToWorkspace(workspaceID: target.id)
         }
 
-        let sourceWorkspaceID = workspaceStore.focusedWorkspaceID
         let currentIndex = workspaceStore.focusedWorkspaceID
             .flatMap { focusedID in workspaces.firstIndex(where: { $0.id == focusedID }) } ?? 0
         let count = workspaces.count
         let wrappedIndex = ((currentIndex + step) % count + count) % count
-        let target = workspaces[wrappedIndex]
-        hasUsedAdjacentJumpSinceBootstrap = true
-        workspaceStore.selectOnly(workspaceID: target.id)
-        return jumpCameraToWorkspace(
-            workspaceID: target.id,
-            fitWidth: !preserveSizeOnSlotJumpEnabled,
-            alignTopLeft: !centerTileOnJumpEnabled,
-            preserveViewportOffsetFromWorkspaceID: preserveSizeOnSlotJumpEnabled ? sourceWorkspaceID : nil
-        )
+        return jumpToWorkspace(workspaceID: workspaces[wrappedIndex].id)
     }
 
     private func jumpCameraToWorkspace(
         workspaceID: UUID,
-        fitWidth: Bool,
+        fitTile: Bool,
         alignTopLeft: Bool = false,
         preserveViewportOffsetFromWorkspaceID: UUID? = nil,
         pushHistory: Bool = true
@@ -2362,14 +2681,18 @@ final class WorkspaceRootViewController: NSViewController {
         guard viewport.width > 1, viewport.height > 1 else { return false }
 
         var magnification = gridView.cameraMagnification
-        if fitWidth {
-            let desiredWidth = max(1.0, viewport.width)
-            magnification = desiredWidth / max(1.0, worldFrame.width)
+        if fitTile {
+            // Fit the whole tile, not just its width: a 4:3 desktop in a wide window
+            // would otherwise overflow vertically and get cropped.
+            magnification = min(
+                max(1.0, viewport.width) / max(1.0, worldFrame.width),
+                max(1.0, viewport.height) / max(1.0, worldFrame.height)
+            )
             magnification = max(minCanvasMagnification, min(maxCanvasMagnification, magnification))
         }
         let safeMag = max(minCanvasMagnification, min(maxCanvasMagnification, magnification))
         let newOrigin: CGPoint
-        if !fitWidth,
+        if !fitTile,
            let sourceWorkspaceID = preserveViewportOffsetFromWorkspaceID,
            let sourceFrame = gridView.frameForWorkspaceInWorld(sourceWorkspaceID) {
             let relativeOffset = CGPoint(
@@ -2380,7 +2703,7 @@ final class WorkspaceRootViewController: NSViewController {
                 x: worldFrame.minX + relativeOffset.x,
                 y: worldFrame.minY + relativeOffset.y
             )
-        } else if alignTopLeft {
+        } else if alignTopLeft, !fitTile {
             newOrigin = CGPoint(
                 x: worldFrame.minX,
                 y: worldFrame.maxY - viewport.height / safeMag
@@ -2527,7 +2850,7 @@ final class WorkspaceRootViewController: NSViewController {
         guard let targetID else { return }
         _ = jumpCameraToWorkspace(
             workspaceID: targetID,
-            fitWidth: true,
+            fitTile: true,
             alignTopLeft: !centerTileOnJumpEnabled,
             pushHistory: false
         )
@@ -2897,6 +3220,7 @@ final class WorkspaceRootViewController: NSViewController {
         let entries = virtual.map { workspace in
             let canvasX = workspace.canvasOrigin.map { Double($0.x) }
             let canvasY = workspace.canvasOrigin.map { Double($0.y) }
+            let profile = displayManager.virtualDisplayProfile(for: workspace.displayID)
             return PersistedWorkspaceState.WorkspaceEntry(
                 title: workspace.title,
                 pixelWidth: max(1, Int(workspace.displayPixelSize.width.rounded())),
@@ -2905,7 +3229,10 @@ final class WorkspaceRootViewController: NSViewController {
                 tileHeight: workspace.tileSize.height,
                 displaySerial: displayManager.virtualDisplaySerial(for: workspace.displayID),
                 canvasX: canvasX,
-                canvasY: canvasY
+                canvasY: canvasY,
+                logicalWidth: profile?.width,
+                logicalHeight: profile?.height,
+                hiDPI: profile?.hiDPI
             )
         }
 
@@ -2930,6 +3257,10 @@ final class WorkspaceRootViewController: NSViewController {
             unlockFPSIfInteracting: unlockFPSIfInteractingEnabled,
             unlockFPSIfLargerThanPercent: unlockFPSIfLargerThanPercentEnabled,
             unlockFPSLargerThanPercentThreshold: unlockFPSLargerThanPercentThreshold,
+            showDisplayPanel: menuDisplayPanelVisible() ? nil : false,
+            defaultDisplayWidth: defaultDisplayResolution?.width,
+            defaultDisplayHeight: defaultDisplayResolution?.height,
+            defaultDisplayHiDPI: defaultDisplayResolution?.hiDPI,
             workspaces: entries
         )
     }
@@ -2948,6 +3279,8 @@ final class WorkspaceRootViewController: NSViewController {
         let unlockFPSIfInteracting: Bool
         let unlockFPSIfLargerThanPercent: Bool
         let unlockFPSLargerThanPercentThreshold: Double
+        let defaultDisplayResolution: DisplayResolution?
+        let showDisplayPanel: Bool
     }
 
     private func buildBootstrapState() -> BootstrapState {
@@ -2967,10 +3300,18 @@ final class WorkspaceRootViewController: NSViewController {
                 limitFPS: 60.0,
                 unlockFPSIfInteracting: true,
                 unlockFPSIfLargerThanPercent: false,
-                unlockFPSLargerThanPercentThreshold: 70.0
+                unlockFPSLargerThanPercentThreshold: 70.0,
+                defaultDisplayResolution: nil,
+                showDisplayPanel: true
             )
         }
-        let profile = displayManager.mainDisplayProfile()
+        let persistedDefaultResolution: DisplayResolution? = {
+            guard let w = persisted.defaultDisplayWidth, let h = persisted.defaultDisplayHeight else { return nil }
+            return DisplayResolution(width: w, height: h, hiDPI: persisted.defaultDisplayHiDPI ?? true)
+        }()
+        let fallbackProfile = persistedDefaultResolution.map {
+            displayManager.profile(width: $0.width, height: $0.height, hiDPI: $0.hiDPI)
+        } ?? displayManager.mainDisplayProfile()
 
         var restored: [Workspace] = []
         var restoredSerialByWorkspaceID: [UUID: UInt32] = [:]
@@ -2978,6 +3319,12 @@ final class WorkspaceRootViewController: NSViewController {
 
         for (index, entry) in persisted.workspaces.enumerated() {
             let title = entry.title.isEmpty ? "\(index + 1)" : entry.title
+            let profile: VirtualDisplayManager.DisplayProfile
+            if let w = entry.logicalWidth, let h = entry.logicalHeight {
+                profile = displayManager.profile(width: w, height: h, hiDPI: entry.hiDPI ?? true)
+            } else {
+                profile = fallbackProfile
+            }
             guard let descriptor = displayManager.createVirtualDisplay(
                 name: title,
                 width: profile.width,
@@ -3035,7 +3382,9 @@ final class WorkspaceRootViewController: NSViewController {
             unlockFPSIfLargerThanPercent: persisted.unlockFPSIfLargerThanPercent ?? false,
             unlockFPSLargerThanPercentThreshold: clampedFPSUnlockCoverageThreshold(
                 persisted.unlockFPSLargerThanPercentThreshold ?? 70.0
-            )
+            ),
+            defaultDisplayResolution: persistedDefaultResolution,
+            showDisplayPanel: persisted.showDisplayPanel ?? true
         )
     }
 
@@ -3112,6 +3461,8 @@ final class WorkspaceRootViewController: NSViewController {
         unlockFPSIfInteractingEnabled = bootstrap.unlockFPSIfInteracting
         unlockFPSIfLargerThanPercentEnabled = bootstrap.unlockFPSIfLargerThanPercent
         unlockFPSLargerThanPercentThreshold = clampedFPSUnlockCoverageThreshold(bootstrap.unlockFPSLargerThanPercentThreshold)
+        defaultDisplayResolution = bootstrap.defaultDisplayResolution
+        setDisplayPanelVisible(bootstrap.showDisplayPanel)
         if requireHoldingMoveShortcutEnabled {
             setWindowFollowToggleActive(false)
         }

@@ -80,6 +80,15 @@ final class WorkspaceStore {
         onDidChange?()
     }
 
+    func renameWorkspace(id: UUID, title: String) {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let index = workspaces.firstIndex(where: { $0.id == id }),
+              workspaces[index].title != trimmed else { return }
+        workspaces[index].title = trimmed
+        onDidChange?()
+    }
+
     func toggleSelection(workspaceID: UUID) {
         guard workspaces.contains(where: { $0.id == workspaceID }) else { return }
         if selectedWorkspaceIDs.contains(workspaceID) {

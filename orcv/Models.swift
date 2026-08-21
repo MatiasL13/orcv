@@ -13,20 +13,27 @@ enum WorkspaceLayoutMode: String {
 struct DisplayDescriptor {
     let displayID: CGDirectDisplayID
     let title: String
+    /// Native backing resolution of the display. Drives aspect ratio and tile size.
     let pixelSize: CGSize
+    /// Resolution to ask the capture stream for. Defaults to native; the canvas asks
+    /// for the size it actually draws, which is usually far smaller.
+    let captureSize: CGSize
     let kind: WorkspaceKind
+    /// Frames per second to request. Zero means "stop capturing this display".
     let maxFPS: Double
 
     init(
         displayID: CGDirectDisplayID,
         title: String,
         pixelSize: CGSize,
+        captureSize: CGSize? = nil,
         kind: WorkspaceKind,
         maxFPS: Double = 60.0
     ) {
         self.displayID = displayID
         self.title = title
         self.pixelSize = pixelSize
+        self.captureSize = captureSize ?? pixelSize
         self.kind = kind
         self.maxFPS = maxFPS
     }
@@ -65,6 +72,23 @@ enum DisplayQuery {
         let result = CGGetDisplaysWithPoint(point, UInt32(onlineDisplayIDs.count), &ids, &count)
         guard result == .success, count > 0 else { return [] }
         return Array(ids.prefix(Int(count)))
+    }
+}
+
+/// Logical size (points) + backing scale used when creating a virtual display.
+struct DisplayResolution: Equatable {
+    var width: Int
+    var height: Int
+    var hiDPI: Bool
+
+    init(width: Int, height: Int, hiDPI: Bool) {
+        self.width = max(320, width)
+        self.height = max(240, height)
+        self.hiDPI = hiDPI
+    }
+
+    init(_ profile: VirtualDisplayManager.DisplayProfile) {
+        self.init(width: profile.width, height: profile.height, hiDPI: profile.hiDPI)
     }
 }
 
