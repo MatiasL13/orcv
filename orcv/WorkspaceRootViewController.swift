@@ -112,6 +112,10 @@ final class WorkspaceRootViewController: NSViewController {
     private var unlockFPSIfInteractingEnabled = true
     private var unlockFPSIfLargerThanPercentEnabled = false
     private var unlockFPSLargerThanPercentThreshold: Double = 70.0
+    /// The display that should keep the menu bar and the Dock. Tracked because a newly
+    /// created virtual display can land on the global origin and take them over.
+    private var preferredMainDisplayID: CGDirectDisplayID?
+    private var didAnnounceTeleportExitHint = false
     private(set) var arrangePadding: CGFloat = 2.0
     /// nil = mirror the main display (default). Otherwise the logical size used for new virtual displays.
     private var defaultDisplayResolution: DisplayResolution?
@@ -357,6 +361,14 @@ final class WorkspaceRootViewController: NSViewController {
 
         displayPanel.onRename = { [weak self] workspaceID, title in
             self?.workspaceStore.renameWorkspace(id: workspaceID, title: title)
+        }
+
+        gridView.onEnterWorkspaceRequest = { [weak self] workspaceID, pointInTile, frameInGrid in
+            self?.teleportIntoWorkspace(
+                workspaceID: workspaceID,
+                pointInTile: pointInTile,
+                frameInGrid: frameInGrid
+            )
         }
 
         gridView.onBackgroundClick = { [weak self] in
@@ -2169,15 +2181,34 @@ final class WorkspaceRootViewController: NSViewController {
         let mouseInScreen = NSEvent.mouseLocation
         let pointInWindow = window.convertPoint(fromScreen: mouseInScreen)
         let pointInGrid = gridView.convert(pointInWindow, from: nil)
-        guard let hit = gridView.hitTestWorkspace(at: pointInGrid),
-              let workspace = workspaceStore.workspace(with: hit.workspaceID) else { return }
+        guard let hit = gridView.hitTestWorkspace(at: pointInGrid) else { return }
+
+        teleportIntoWorkspace(
+            workspaceID: hit.workspaceID,
+            pointInTile: hit.pointInTile,
+            frameInGrid: hit.frameInGrid
+        )
+    }
+
+    private func teleportIntoWorkspace(workspaceID: UUID, pointInTile: CGPoint, frameInGrid: CGRect) {
+        guard let workspace = workspaceStore.workspace(with: workspaceID) else { return }
+        guard workspace.kind == .virtual else { return }
 
         pointerRouter.teleportInto(
             workspace: workspace,
-            pointInTile: hit.pointInTile,
-            tileFrameInWindow: hit.frameInGrid
+            pointInTile: pointInTile,
+            tileFrameInWindow: frameInGrid
         )
         scheduleArrangementSync()
+        announceTeleportExitHintIfNeeded()
+    }
+
+    /// Entering is now discoverable (double click) but leaving is not, so say how once.
+    private func announceTeleportExitHintIfNeeded() {
+        guard !didAnnounceTeleportExitHint else { return }
+        didAnnounceTeleportExitHint = true
+        let shortcut = shortcutManager.displayString(for: .toggleTeleport)
+        showToast("Press \(shortcut) to come back to the canvas")
     }
 
     private func teleportBackFromPresentedPreviewIfNeeded() {
@@ -2285,6 +2316,8 @@ final class WorkspaceRootViewController: NSViewController {
             lastQueuedArrangementSignature = nil
             return
         }
+        // Read on the main thread: compute... refreshed it just above.
+        let mainDisplayID = preferredMainDisplayID
 
         arrangementApplyQueue.async { [weak self] in
             guard let self else { return }
@@ -2293,7 +2326,10 @@ final class WorkspaceRootViewController: NSViewController {
                 shouldApply = (generation == self.arrangementGeneration)
             }
             guard shouldApply else { return }
-            let didApply = self.displayManager.applyDisplayOrigins(finalOrigins)
+            let didApply = self.displayManager.applyDisplayOrigins(
+                finalOrigins,
+                mainDisplayID: mainDisplayID
+            )
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 guard generation == self.arrangementGeneration else { return }
@@ -2316,15 +2352,32 @@ final class WorkspaceRootViewController: NSViewController {
             lastAppliedArrangementSignature = signature
             return
         }
-        if displayManager.applyDisplayOrigins(finalOrigins) {
+        if displayManager.applyDisplayOrigins(finalOrigins, mainDisplayID: preferredMainDisplayID) {
             lastAppliedOrigins = finalOrigins
             lastAppliedArrangementSignature = signature
         }
     }
 
+    /// The user's own choice of main display wins, so this follows `CGMainDisplayID()`
+    /// whenever it points at a real display and only remembers the last real one when a
+    /// virtual display has taken over.
+    private func refreshPreferredMainDisplayID() {
+        let virtualIDs = Set(workspaceStore.workspaces.filter { $0.kind == .virtual }.map(\.displayID))
+        let currentMain = CGMainDisplayID()
+        if !virtualIDs.contains(currentMain) {
+            preferredMainDisplayID = currentMain
+            return
+        }
+        if let remembered = preferredMainDisplayID, !virtualIDs.contains(remembered) {
+            return
+        }
+        preferredMainDisplayID = DisplayQuery.onlineDisplayIDs().first { !virtualIDs.contains($0) }
+    }
+
     private func computeDisplayArrangementOriginsFromGrid() -> [CGDirectDisplayID: CGPoint] {
         let virtualWorkspaces = workspaceStore.workspaces.filter { $0.kind == .virtual }
         guard !virtualWorkspaces.isEmpty else { return [:] }
+        refreshPreferredMainDisplayID()
 
         struct Entry {
             let displayID: CGDirectDisplayID
@@ -2366,7 +2419,16 @@ final class WorkspaceRootViewController: NSViewController {
             let mappedY = displayMinY + (topLeftYForEntry(entry) - tileMinY) * scale
             finalOrigins[entry.displayID] = CGPoint(x: mappedX.rounded(), y: mappedY.rounded())
         }
-        return finalOrigins
+
+        guard let mainDisplayID = preferredMainDisplayID else { return finalOrigins }
+        return DisplayArrangement.shiftClearingMainDisplay(
+            origins: finalOrigins,
+            sizes: Dictionary(
+                entries.map { ($0.displayID, $0.displayBounds.size) },
+                uniquingKeysWith: { first, _ in first }
+            ),
+            mainDisplayRect: CGDisplayBounds(mainDisplayID)
+        )
     }
 
     private func arrangementSignatureForCurrentGrid() -> UInt64? {

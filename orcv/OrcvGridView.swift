@@ -98,6 +98,7 @@ final class OrcvGridView: NSView {
     }
 
     var onFocusRequest: ((UUID, CGPoint, CGRect, NSEvent.ModifierFlags) -> Void)?
+    var onEnterWorkspaceRequest: ((UUID, CGPoint, CGRect) -> Void)?
     var onBackgroundClick: (() -> Void)?
     var onReorderCommit: (([UUID]) -> Void)?
     var onCanvasMoveCommit: ((_ workspaceID: UUID, _ newOrigin: CGPoint, _ oldOrigin: CGPoint?) -> Void)?
@@ -213,6 +214,12 @@ final class OrcvGridView: NSView {
         canvasCursor.set()
     }
 
+    // The orcv window is usually unfocused. Without this the first click is swallowed
+    // by activation, which would also make two separate clicks arrive as a double click.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
 
@@ -227,6 +234,10 @@ final class OrcvGridView: NSView {
                   frame.contains(point) else { continue }
 
             let pointInTile = CGPoint(x: point.x - frame.minX, y: point.y - frame.minY)
+            if event.clickCount == 2, !isSelectionToggleClick {
+                onEnterWorkspaceRequest?(workspace.id, pointInTile, frame)
+                return
+            }
             if isSelectionToggleClick {
                 onFocusRequest?(workspace.id, pointInTile, frame, modifiers)
                 return

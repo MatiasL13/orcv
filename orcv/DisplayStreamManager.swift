@@ -1,207 +1,317 @@
 import CoreGraphics
+import CoreMedia
 import CoreVideo
 import Foundation
 import IOSurface
+import ScreenCaptureKit
 
-private typealias CGDisplayFrameHandler = @convention(block) (Int32, UInt64, IOSurface?, CFTypeRef?) -> Void
-
-@_silgen_name("CGDisplayStreamCreateWithDispatchQueue")
-private func rawCGDisplayStreamCreateWithDispatchQueue(
-    _ display: CGDirectDisplayID,
-    _ outputWidth: Int,
-    _ outputHeight: Int,
-    _ pixelFormat: Int32,
-    _ properties: CFDictionary?,
-    _ queue: DispatchQueue,
-    _ handler: CGDisplayFrameHandler?
-) -> Unmanaged<CFTypeRef>?
-
-@_silgen_name("CGDisplayStreamStart")
-private func rawCGDisplayStreamStart(_ stream: CFTypeRef?) -> Int32
-
-@_silgen_name("CGDisplayStreamStop")
-private func rawCGDisplayStreamStop(_ stream: CFTypeRef?) -> Int32
-
+/// Captures each display through ScreenCaptureKit and hands out the latest IOSurface
+/// per display, ready to be assigned to a CALayer's contents.
+///
+/// Two properties of SCStream shape this design:
+/// - The configuration carries `width`/`height`, so the compositor does the downscale
+///   and we never move more pixels than the canvas draws.
+/// - `updateConfiguration` changes size and frame rate in place, so a zoom or an fps
+///   change no longer tears the stream down and leaves a gap in the picture.
 final class DisplayStreamManager {
-    private struct StreamEntry {
-        let stream: CFTypeRef
-        let handler: CGDisplayFrameHandler
-        let width: Int
-        let height: Int
-        let maxFPS: Double
-    }
-
-    private var entries: [CGDirectDisplayID: StreamEntry] = [:]
-    private var latestSurfaces: [CGDirectDisplayID: IOSurface] = [:]
-    private var targetDescriptors: [CGDirectDisplayID: DisplayDescriptor] = [:]
-
-    private let controlQueue = DispatchQueue(label: "today.jason.orcv.stream-control")
-    private let callbackQueue = DispatchQueue(label: "today.jason.orcv.stream-callback", qos: .userInteractive)
-    private let surfaceQueue = DispatchQueue(label: "today.jason.orcv.surface-store", attributes: .concurrent)
-
     var onFrame: (() -> Void)?
     var onDisplayFrame: ((CGDirectDisplayID, IOSurface) -> Void)?
     var onError: ((String) -> Void)?
 
-    func stopAll() {
-        controlQueue.sync {
-            targetDescriptors.removeAll()
-            let ids = Array(entries.keys)
-            for displayID in ids {
-                stopStream(for: displayID)
-            }
-        }
-    }
+    private let controller: CaptureController
+    private let surfaceStore = SurfaceStore()
 
-    func configureStreams(for descriptors: [DisplayDescriptor]) {
-        controlQueue.async { [weak self] in
-            self?.reconfigure(descriptors: descriptors)
-        }
-    }
-
-    func latestSurface(for displayID: CGDirectDisplayID) -> IOSurface? {
-        surfaceQueue.sync {
-            latestSurfaces[displayID]
-        }
-    }
-
-    private func reconfigure(descriptors: [DisplayDescriptor]) {
-        var uniqueByDisplay: [CGDirectDisplayID: DisplayDescriptor] = [:]
-        for descriptor in descriptors where uniqueByDisplay[descriptor.displayID] == nil {
-            uniqueByDisplay[descriptor.displayID] = descriptor
-        }
-        targetDescriptors = uniqueByDisplay
-
-        let targetIDs = Set(uniqueByDisplay.keys)
-        let existingIDs = Set(entries.keys)
-
-        for removeID in existingIDs.subtracting(targetIDs) {
-            stopStream(for: removeID)
-        }
-
-        for (displayID, descriptor) in uniqueByDisplay {
-            // Zero fps means the tile is not on screen: release the stream and its
-            // surface pool entirely instead of capturing it at a trickle.
-            guard descriptor.maxFPS > 0.0 else {
-                stopStream(for: displayID, discardLastFrame: false)
-                continue
-            }
-
-            let expectedWidth = Int(max(1.0, descriptor.captureSize.width))
-            let expectedHeight = Int(max(1.0, descriptor.captureSize.height))
-            let expectedMaxFPS = normalizedMaxFPS(descriptor.maxFPS)
-
-            if let existing = entries[displayID] {
-                if existing.width != expectedWidth
-                    || existing.height != expectedHeight
-                    || abs(existing.maxFPS - expectedMaxFPS) > 0.0001 {
-                    stopStream(for: displayID)
-                    startStream(for: descriptor, attempt: 0)
-                }
-                continue
-            }
-
-            startStream(for: descriptor, attempt: 0)
-        }
-    }
-
-    private func startStream(for descriptor: DisplayDescriptor, attempt: Int) {
-        guard let target = targetDescriptors[descriptor.displayID], target.maxFPS > 0.0 else {
-            return
-        }
-        if entries[descriptor.displayID] != nil {
-            return
-        }
-
-        let outputWidth = Int(max(1.0, descriptor.captureSize.width))
-        let outputHeight = Int(max(1.0, descriptor.captureSize.height))
-        let maxFPS = normalizedMaxFPS(descriptor.maxFPS)
-        let minFrameTime = 1.0 / maxFPS
-        let streamProperties: CFDictionary = [
-            "kCGDisplayStreamShowCursor" as CFString: kCFBooleanTrue as Any,
-            CGDisplayStream.minimumFrameTime as CFString: NSNumber(value: minFrameTime),
-            // Default is 3; two is enough here and each surface costs width*height*4.
-            CGDisplayStream.queueDepth as CFString: NSNumber(value: 2),
-        ] as CFDictionary
-
-        let handler: CGDisplayFrameHandler = { [weak self] status, _, frameSurface, _ in
+    init() {
+        controller = CaptureController(surfaceStore: surfaceStore)
+        controller.onFrame = { [weak self] displayID, surface in
             guard let self else { return }
-            guard status == 0, let frameSurface else { return }
-            let displayID = descriptor.displayID
-
-            self.surfaceQueue.sync(flags: .barrier) {
-                self.latestSurfaces[displayID] = frameSurface
-            }
-
             DispatchQueue.main.async {
-                self.onDisplayFrame?(displayID, frameSurface)
+                self.onDisplayFrame?(displayID, surface)
                 self.onFrame?()
             }
         }
+        controller.onError = { [weak self] message in
+            self?.onError?(message)
+        }
+    }
 
-        guard let streamRef = rawCGDisplayStreamCreateWithDispatchQueue(
-            descriptor.displayID,
-            outputWidth,
-            outputHeight,
-            Int32(kCVPixelFormatType_32BGRA),
-            streamProperties,
-            callbackQueue,
-            handler
-        ) else {
-            if attempt < 30 {
-                controlQueue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-                    self?.startStream(for: descriptor, attempt: attempt + 1)
-                }
-            } else {
-                DispatchQueue.main.async {
-                    self.onError?("CGDisplayStream creation failed for display \(descriptor.displayID)")
+    func stopAll() {
+        controller.stopAll()
+    }
+
+    func configureStreams(for descriptors: [DisplayDescriptor]) {
+        controller.configure(descriptors: descriptors)
+    }
+
+    func latestSurface(for displayID: CGDirectDisplayID) -> IOSurface? {
+        surfaceStore.surface(for: displayID)
+    }
+}
+
+/// Readable from the main thread on every layout pass, written from the capture queue.
+/// Unchecked because every access goes through `queue`.
+private final class SurfaceStore: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "today.jason.orcv.surface-store", attributes: .concurrent)
+    private var surfaces: [CGDirectDisplayID: IOSurface] = [:]
+
+    func surface(for displayID: CGDirectDisplayID) -> IOSurface? {
+        queue.sync { surfaces[displayID] }
+    }
+
+    func store(_ surface: IOSurface, for displayID: CGDirectDisplayID) {
+        queue.async(flags: .barrier) { self.surfaces[displayID] = surface }
+    }
+
+    func remove(_ displayID: CGDirectDisplayID) {
+        queue.async(flags: .barrier) { self.surfaces.removeValue(forKey: displayID) }
+    }
+
+    func removeAll() {
+        queue.async(flags: .barrier) { self.surfaces.removeAll() }
+    }
+}
+
+/// Serializes every mutation of the stream set. Enumerating shareable content is slow
+/// (seconds, measured), so the display catalog is cached and only refreshed when a
+/// requested display is missing from it.
+/// Unchecked because every mutation of its state goes through the serial `queue`.
+private final class CaptureController: @unchecked Sendable {
+    private struct Entry {
+        let stream: SCStream
+        let output: FrameCollector
+        var width: Int
+        var height: Int
+        var fps: Double
+    }
+
+    var onFrame: ((CGDirectDisplayID, IOSurface) -> Void)?
+    var onError: ((String) -> Void)?
+
+    private let surfaceStore: SurfaceStore
+    private let queue = DispatchQueue(label: "today.jason.orcv.stream-control")
+    private let sampleQueue = DispatchQueue(label: "today.jason.orcv.stream-callback", qos: .userInteractive)
+
+    private var entries: [CGDirectDisplayID: Entry] = [:]
+    private var displayCatalog: [CGDirectDisplayID: SCDisplay] = [:]
+    private var latestDescriptors: [CGDirectDisplayID: DisplayDescriptor] = [:]
+    private var reportedErrors = Set<String>()
+    private var isApplying = false
+    private var isDirty = false
+
+    init(surfaceStore: SurfaceStore) {
+        self.surfaceStore = surfaceStore
+    }
+
+    func configure(descriptors: [DisplayDescriptor]) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            var unique: [CGDirectDisplayID: DisplayDescriptor] = [:]
+            for descriptor in descriptors where unique[descriptor.displayID] == nil {
+                unique[descriptor.displayID] = descriptor
+            }
+            self.latestDescriptors = unique
+            self.isDirty = true
+            self.pumpOnQueue()
+        }
+    }
+
+    func stopAll() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.latestDescriptors = [:]
+            self.isDirty = false
+            let streams = self.entries.values.map(\.stream)
+            self.entries.removeAll()
+            self.surfaceStore.removeAll()
+            Task {
+                for stream in streams {
+                    try? await stream.stopCapture()
                 }
             }
+        }
+    }
+
+    /// One apply in flight at a time. Anything that arrives while it runs sets the
+    /// dirty flag, so the newest descriptors always get applied exactly once more.
+    /// Must be called on `queue`.
+    private func pumpOnQueue() {
+        guard !isApplying, isDirty else { return }
+        isApplying = true
+        isDirty = false
+        Task { [weak self] in
+            guard let self else { return }
+            await self.apply()
+            self.queue.async {
+                self.isApplying = false
+                self.pumpOnQueue()
+            }
+        }
+    }
+
+    private func snapshot() -> [CGDirectDisplayID: DisplayDescriptor] {
+        queue.sync { latestDescriptors }
+    }
+
+    private func apply() async {
+        let descriptors = snapshot()
+
+        for displayID in queue.sync(execute: { Array(entries.keys) }) {
+            guard let descriptor = descriptors[displayID] else {
+                await teardown(displayID: displayID, keepLastFrame: false)
+                continue
+            }
+            if descriptor.maxFPS <= 0.0 {
+                // Off-screen: release the stream but keep the last frame on the tile.
+                await teardown(displayID: displayID, keepLastFrame: true)
+            }
+        }
+
+        for (displayID, descriptor) in descriptors where descriptor.maxFPS > 0.0 {
+            let width = Int(max(1.0, descriptor.captureSize.width.rounded()))
+            let height = Int(max(1.0, descriptor.captureSize.height.rounded()))
+
+            if let entry = queue.sync(execute: { entries[displayID] }) {
+                let sameSize = entry.width == width && entry.height == height
+                let sameFPS = abs(entry.fps - descriptor.maxFPS) <= 0.0001
+                if sameSize, sameFPS { continue }
+                if await update(displayID: displayID, entry: entry, width: width, height: height, fps: descriptor.maxFPS) {
+                    continue
+                }
+                await teardown(displayID: displayID, keepLastFrame: true)
+            }
+
+            await start(displayID: displayID, width: width, height: height, fps: descriptor.maxFPS)
+        }
+    }
+
+    private func update(displayID: CGDirectDisplayID, entry: Entry, width: Int, height: Int, fps: Double) async -> Bool {
+        guard #available(macOS 14.0, *) else { return false }
+        do {
+            try await entry.stream.updateConfiguration(
+                Self.configuration(width: width, height: height, fps: fps)
+            )
+            queue.sync {
+                if var stored = entries[displayID] {
+                    stored.width = width
+                    stored.height = height
+                    stored.fps = fps
+                    entries[displayID] = stored
+                }
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func start(displayID: CGDirectDisplayID, width: Int, height: Int, fps: Double) async {
+        guard let display = await resolveDisplay(displayID) else {
+            report("Display \(displayID) is not available for capture")
             return
         }
 
-        let stream = streamRef.takeRetainedValue()
-        let startResult = rawCGDisplayStreamStart(stream)
-        guard startResult == 0 else {
-            if attempt < 30 {
-                controlQueue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-                    self?.startStream(for: descriptor, attempt: attempt + 1)
-                }
-            } else {
-                DispatchQueue.main.async {
-                    self.onError?("CGDisplayStream start failed for display \(descriptor.displayID): \(startResult)")
-                }
-            }
-            return
+        let output = FrameCollector { [weak self] surface in
+            guard let self else { return }
+            self.surfaceStore.store(surface, for: displayID)
+            self.onFrame?(displayID, surface)
         }
-
-        entries[descriptor.displayID] = StreamEntry(
-            stream: stream,
-            handler: handler,
-            width: outputWidth,
-            height: outputHeight,
-            maxFPS: maxFPS
+        let stream = SCStream(
+            filter: SCContentFilter(display: display, excludingWindows: []),
+            configuration: Self.configuration(width: width, height: height, fps: fps),
+            delegate: nil
         )
-    }
 
-    private func normalizedMaxFPS(_ fps: Double) -> Double {
-        guard fps.isFinite else { return 60.0 }
-        return min(120.0, max(1.0, fps))
-    }
-
-    /// `discardLastFrame: false` keeps the cached surface so a paused tile shows its
-    /// last frame instead of going blank.
-    private func stopStream(for displayID: CGDirectDisplayID, discardLastFrame: Bool = true) {
-        guard let entry = entries.removeValue(forKey: displayID) else { return }
-        _ = entry.handler
-        _ = entry.width
-        _ = entry.height
-
-        _ = rawCGDisplayStreamStop(entry.stream)
-
-        guard discardLastFrame else { return }
-        _ = surfaceQueue.sync(flags: .barrier) {
-            latestSurfaces.removeValue(forKey: displayID)
+        do {
+            try stream.addStreamOutput(output, type: .screen, sampleHandlerQueue: sampleQueue)
+            try await stream.startCapture()
+        } catch {
+            report("Capture failed for display \(displayID): \(error.localizedDescription)")
+            return
         }
+
+        var stale = false
+        queue.sync {
+            guard let descriptor = latestDescriptors[displayID], descriptor.maxFPS > 0.0 else {
+                stale = true
+                return
+            }
+            entries[displayID] = Entry(stream: stream, output: output, width: width, height: height, fps: fps)
+        }
+        if stale {
+            try? await stream.stopCapture()
+        }
+    }
+
+    private func teardown(displayID: CGDirectDisplayID, keepLastFrame: Bool) async {
+        let entry: Entry? = queue.sync { entries.removeValue(forKey: displayID) }
+        guard let entry else { return }
+        if !keepLastFrame {
+            surfaceStore.remove(displayID)
+        }
+        try? await entry.stream.stopCapture()
+    }
+
+    /// Cached: SCShareableContent enumeration was measured taking seconds.
+    private func resolveDisplay(_ displayID: CGDirectDisplayID) async -> SCDisplay? {
+        if let cached = queue.sync(execute: { displayCatalog[displayID] }) {
+            return cached
+        }
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(
+                false,
+                onScreenWindowsOnly: false
+            )
+            queue.sync {
+                displayCatalog = Dictionary(
+                    content.displays.map { ($0.displayID, $0) },
+                    uniquingKeysWith: { first, _ in first }
+                )
+            }
+        } catch {
+            report("Screen capture unavailable: \(error.localizedDescription)")
+            return nil
+        }
+        return queue.sync { displayCatalog[displayID] }
+    }
+
+    private func report(_ message: String) {
+        // Same message repeats every refresh otherwise.
+        let isNew: Bool = queue.sync { reportedErrors.insert(message).inserted }
+        guard isNew else { return }
+        onError?(message)
+    }
+
+    private static func configuration(width: Int, height: Int, fps: Double) -> SCStreamConfiguration {
+        let config = SCStreamConfiguration()
+        config.width = width
+        config.height = height
+        config.pixelFormat = kCVPixelFormatType_32BGRA
+        config.showsCursor = true
+        // Keep the system default depth: we retain the latest surface to hold the last
+        // frame of paused tiles, and a shallow pool risks it being recycled underneath us.
+        config.queueDepth = 3
+        config.capturesAudio = false
+        config.scalesToFit = false
+        let safeFPS = min(120.0, max(1.0, fps.isFinite ? fps : 60.0))
+        config.minimumFrameInterval = CMTime(
+            value: 1,
+            timescale: CMTimeScale(safeFPS.rounded())
+        )
+        return config
+    }
+}
+
+private final class FrameCollector: NSObject, SCStreamOutput {
+    private let onSurface: (IOSurface) -> Void
+
+    init(onSurface: @escaping (IOSurface) -> Void) {
+        self.onSurface = onSurface
+    }
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer buffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .screen, buffer.isValid else { return }
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(buffer) else { return }
+        guard let surfaceRef = CVPixelBufferGetIOSurface(pixelBuffer) else { return }
+        onSurface(surfaceRef.takeUnretainedValue())
     }
 }

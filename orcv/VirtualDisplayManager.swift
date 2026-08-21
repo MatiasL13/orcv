@@ -250,12 +250,22 @@ final class VirtualDisplayManager {
         virtualDisplayProfiles[displayID]
     }
 
-    func applyDisplayOrigins(_ origins: [CGDirectDisplayID: CGPoint]) -> Bool {
+    /// `mainDisplayID`, when given, is pinned to the global origin in the same
+    /// transaction. The display at (0,0) owns the menu bar and the Dock, so
+    /// reasserting it is what stops a virtual display from stealing them.
+    func applyDisplayOrigins(
+        _ origins: [CGDirectDisplayID: CGPoint],
+        mainDisplayID: CGDirectDisplayID? = nil
+    ) -> Bool {
         guard !origins.isEmpty else { return true }
 
         var configRef: CGDisplayConfigRef?
         guard CGBeginDisplayConfiguration(&configRef) == .success, let configRef else {
             return false
+        }
+
+        if let mainDisplayID, origins[mainDisplayID] == nil {
+            CGConfigureDisplayOrigin(configRef, mainDisplayID, 0, 0)
         }
 
         for (displayID, origin) in origins {

@@ -1,6 +1,4 @@
 import AppKit
-import CoreMedia
-import ScreenCaptureKit
 import CoreGraphics
 import Foundation
 
@@ -38,7 +36,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
         installMainMenu()
         evaluateLaunchPermissions()
-        AppDelegate.runScreenCaptureKitProbeIfRequested()
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
@@ -1380,89 +1377,5 @@ private final class OrcvAboutWindowController: NSWindowController {
         let version = (bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "0.1.0"
         let build = (bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String) ?? "1"
         return "Version \(version) (\(build))"
-    }
-}
-
-// MARK: - Temporary ScreenCaptureKit viability probe (ORCV_SCK_SPIKE=1)
-// Answers whether CGVirtualDisplays show up in ScreenCaptureKit before committing to
-// the migration. Delete this extension once the answer is recorded.
-extension AppDelegate {
-    static func runScreenCaptureKitProbeIfRequested() {
-        guard ProcessInfo.processInfo.environment["ORCV_SCK_SPIKE"] == "1" else { return }
-        let path = ProcessInfo.processInfo.environment["ORCV_SCK_SPIKE_OUT"]
-            ?? "/tmp/orcv_sck_probe.txt"
-        var log = ""
-        func say(_ line: String) {
-            log += line + "\n"
-            try? log.write(toFile: path, atomically: true, encoding: .utf8)
-            NSLog("SCK_PROBE %@", line)
-        }
-
-        Task {
-            let online = DisplayQuery.onlineDisplayIDs()
-            say("online displays (CoreGraphics): \(online)")
-            do {
-                let content = try await SCShareableContent.excludingDesktopWindows(
-                    false,
-                    onScreenWindowsOnly: false
-                )
-                let sckIDs = content.displays.map { $0.displayID }
-                say("ScreenCaptureKit displays:    \(sckIDs)")
-                let missing = online.filter { !sckIDs.contains($0) }
-                say(missing.isEmpty
-                    ? "RESULT: SCK sees every display, virtual ones included"
-                    : "RESULT: SCK does NOT see: \(missing)")
-
-                guard let target = content.displays.last else { return }
-                say("probing capture of display \(target.displayID) native \(target.width)x\(target.height)")
-                let config = SCStreamConfiguration()
-                config.width = 800
-                config.height = 600
-                config.pixelFormat = kCVPixelFormatType_32BGRA
-                config.showsCursor = true
-                config.queueDepth = 2
-                config.minimumFrameInterval = CMTime(value: 1, timescale: 10)
-                let stream = SCStream(
-                    filter: SCContentFilter(display: target, excludingWindows: []),
-                    configuration: config,
-                    delegate: nil
-                )
-                let collector = SCKProbeCollector()
-                try stream.addStreamOutput(collector, type: .screen, sampleHandlerQueue: .global())
-                try await stream.startCapture()
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-                say("frames in 2s: \(collector.frames) delivered \(collector.lastSize) iosurface=\(collector.iosurfaceBacked)")
-                if #available(macOS 14.0, *) {
-                    let next = SCStreamConfiguration()
-                    next.width = 400
-                    next.height = 300
-                    next.pixelFormat = kCVPixelFormatType_32BGRA
-                    next.showsCursor = true
-                    next.queueDepth = 2
-                    next.minimumFrameInterval = CMTime(value: 1, timescale: 30)
-                    let before = collector.frames
-                    try await stream.updateConfiguration(next)
-                    try? await Task.sleep(nanoseconds: 1_500_000_000)
-                    say("updateConfiguration OK: no recreate, frames +\(collector.frames - before), now \(collector.lastSize)")
-                }
-                try await stream.stopCapture()
-                say("DONE")
-            } catch {
-                say("ERROR: \(error)")
-            }
-        }
-    }
-}
-
-final class SCKProbeCollector: NSObject, SCStreamOutput {
-    private(set) var frames = 0
-    private(set) var lastSize = "-"
-    private(set) var iosurfaceBacked = false
-
-    func stream(_ stream: SCStream, didOutputSampleBuffer buffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(buffer) else { return }
-        frames += 1
-        lastSize = "\(CVPixelBufferGetWidth(pixelBuffer))x\(CVPixelBufferGetHeight(pixelBuffer))"
-        if CVPixelBufferGetIOSurface(pixelBuffer) != nil { iosurfaceBacked = true }
     }
 }
